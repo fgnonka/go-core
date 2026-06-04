@@ -1,47 +1,50 @@
 package data
 
 import (
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"fmt"
-	"sync"
 	"time"
 )
 
 type Store struct {
-	mu           sync.RWMutex
-	entities     map[string]*Entity
-	transactions []Transaction
+	db *sql.DB
 }
 
-func NewStore() *Store {
-	// Seed with dummy entities for our CRUD simulations
-	s := &Store{
-		entities: make(map[string]*Entity),
-	}
-	s.entities["asec"] = &Entity{ID: "asec", Name: "Asec Mimosas FC", WalletBalance: 0.0}
-	s.entities["jca"] = &Entity{ID: "jca", Name: "JCA Kings", WalletBalance: 500.0} // Pre-funded to test withdrawal threshold
-	return s
+func NewStore(db *sql.DB) *Store {
+	return &Store{db: db}
 }
 
-func ListEntities(s *Store) []*Entity {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Store) ListEntities() ([]Entity, error) {
+	query := `SELECT id, name, wallet_balance FROM entities`
 
-	entities := make([]*Entity, 0, len(s.entities))
-	for _, entity := range s.entities {
-		entities = append(entities, entity)
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
 	}
-	return entities
+	defer rows.Close()
+
+	var entities []Entity
+	for rows.Next() {
+		var e Entity
+		if err := rows.Scan(&e.ID, &e.Name, &e.WalletBalance); err != nil {
+			return nil, err
+		}
+		entities = append(entities, e)
+	}
+
+	return entities, nil
 }
 
 func GetEntity(s *Store, id string) *Entity {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	entity, exists := s.entities[id]
-	if !exists {
+	query := `SELECT id, name, wallet_balance FROM entities WHERE id = ?`
+	row := s.db.QueryRow(query, id)
+	var e Entity
+	if err := row.Scan(&e.ID, &e.Name, &e.WalletBalance); err != nil {
 		return nil
 	}
-	return entity
+	return &e
 }
 
 // ProcessTip simulates receiving funds from an external mobile wallet
@@ -49,64 +52,109 @@ func ProcessTip(s *Store, entityID string, amount float64) (*Transaction, error)
 	if amount <= 0 {
 		return nil, ErrInvalidAmount
 	}
+	// Use a background context for execution control
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// 1. Begin the ACID Transaction
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Ensure the transaction is rolled back if any error occurs
+	defer tx.Rollback()
 
-	entity, exists := s.entities[entityID]
-	if !exists {
+	// 2. Lock the entity's row for update
+	var exists bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM entities WHERE id = ?)`, entityID).Scan(&exists)
+	if err != nil || !exists {
 		return nil, ErrEntityNotFound
 	}
 
-	// Update the entity's wallet balance
-	entity.WalletBalance += amount
+	// 3. Update the entity's wallet balance
+	_, err = tx.ExecContext(ctx, `UPDATE entities SET wallet_balance = wallet_balance + ? WHERE id = ?`, amount, entityID)
+	if err != nil {
+		return nil, err
+	}
 
-	// Log the transaction
-	tx := Transaction{
+	// 4. Log the transaction
+	newTx := Transaction{
 		ID:        generateID(),
 		EntityID:  entityID,
 		Amount:    amount,
 		Type:      "tip",
 		Timestamp: time.Now(),
 	}
-	s.transactions = append(s.transactions, tx)
+	_, err = tx.ExecContext(ctx, `INSERT INTO transactions (id, entity_id, amount, type, timestamp) VALUES (?, ?, ?, ?, ?)`,
+		newTx.ID, newTx.EntityID, newTx.Amount, newTx.Type, newTx.Timestamp)
+	if err != nil {
+		return nil, err
+	}
 
-	return &tx, nil
+	// 5. Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &newTx, nil
 }
 
 // ProcessWithdrawal simulates sending funds to an external mobile wallet
 func ProcessWithdrawal(s *Store, entityID string, amount float64) (*Transaction, error) {
-	const minThreshold = 1000.0 // Teams can only withdraw if amount >= 1000F CFA
+	const minThreshold = 1000.0 // Entities can only withdraw if amount >= 1000F CFA
 
 	if amount < minThreshold {
 		return nil, ErrBelowThreshold
 	}
+	// Use a background context for execution control
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// 1. Begin the ACID Transaction
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Ensure the transaction is rolled back if any error occurs
+	defer tx.Rollback()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	entity, exists := s.entities[entityID]
-	if !exists {
-		return nil, ErrEntityNotFound
+	var currentBalance float64
+	err = tx.QueryRowContext(ctx, `SELECT wallet_balance FROM entities WHERE id = ? FOR UPDATE`, entityID).Scan(&currentBalance)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrEntityNotFound
+		}
+		return nil, err
 	}
 
-	if entity.WalletBalance < amount {
+	if currentBalance < amount {
 		return nil, ErrInsufficientFunds
 	}
 
-	// Update the entity's wallet balance
-	entity.WalletBalance -= amount
+	// 2. Update the entity's wallet balance
+	_, err = tx.ExecContext(ctx, `UPDATE entities SET wallet_balance = wallet_balance - ? WHERE id = ?`, amount, entityID)
+	if err != nil {
+		return nil, err
+	}
 
-	// Log the transaction
-	tx := Transaction{
+	// 3. Log the transaction
+	newTx := Transaction{
 		ID:        generateID(),
 		EntityID:  entityID,
 		Amount:    amount,
 		Type:      "withdrawal",
 		Timestamp: time.Now(),
 	}
-	s.transactions = append(s.transactions, tx)
-	return &tx, nil
+
+	_, err = tx.ExecContext(ctx, `INSERT INTO transactions (id, entity_id, amount, type, timestamp) VALUES (?, ?, ?, ?, ?)`,
+		newTx.ID, newTx.EntityID, newTx.Amount, newTx.Type, newTx.Timestamp)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &newTx, nil
 }
 
 // Basic cryptographically secure ID generator helper

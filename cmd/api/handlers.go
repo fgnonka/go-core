@@ -19,8 +19,12 @@ type application struct {
 	store *data.Store
 }
 
-func (app *application) handleListTeams(w http.ResponseWriter, r *http.Request) {
-	entities := data.ListEntities(app.store)
+func (app *application) handleListEntities(w http.ResponseWriter, r *http.Request) {
+	entities, err := app.store.ListEntities()
+	if err != nil {
+		writeJsonResponse(w, http.StatusInternalServerError, JsonResponse{"error": "failed to retrieve entities"})
+		return
+	}
 	writeJsonResponse(w, http.StatusOK, JsonResponse{"entities": entities})
 }
 
@@ -34,6 +38,7 @@ func (app *application) handleProcessTip(w http.ResponseWriter, r *http.Request)
 	entityID := r.PathValue("id")
 
 	var payload tipPayload
+	println("Received tip of value:", payload.Amount, "for entity ID:", entityID)
 	err := json.NewDecoder(r.Body).Decode(&payload)
 	if err != nil {
 		writeJsonResponse(w, http.StatusBadRequest, JsonResponse{"error": "invalid JSON payload"})
